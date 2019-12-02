@@ -48,7 +48,9 @@ def ridge_cv(X, Y, alphas, independent_alphas=False, Uv=None):
     assert len(X) == len(Y)
 
     # Prepare function depending on whether data is numpy or torch
-    npt = NumTorch('torch' if isinstance(X, torch.Tensor) else 'numpy')
+    module = 'torch' if isinstance(X, torch.Tensor) else 'numpy'
+    device = X.device if module == 'torch' else None
+    npt = NumTorch(module, device=device)
 
     if isinstance(alphas, (float, int)):
         alphas = npt.array([alphas, ], dtype=X.dtype)
@@ -142,7 +144,9 @@ class RidgeCV(RegressorMixin, BaseEstimator):
         assert len(Y.shape) > 1
 
         # Prepare function depending on whether data is numpy or torch
-        npt = NumTorch('torch' if isinstance(X, torch.Tensor) else 'numpy')
+        module = 'torch' if isinstance(X, torch.Tensor) else 'numpy'
+        device = X.device if module == 'torch' else None
+        npt = NumTorch(module, device=device)
 
         # preprocess
         if self.fit_intercept:
