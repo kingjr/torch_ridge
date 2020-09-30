@@ -16,7 +16,28 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from .numtorch import NumTorch, assert_tensor_almost_equal
 
 
-def ridge_cv(X, Y, alphas, independent_alphas=False, Uv=None):
+def correlate(X, Y):
+    module = "torch" if isinstance(X, torch.Tensor) else "numpy"
+    device = X.device if module == "torch" else None
+    npt = NumTorch(module, device=device)
+
+    if X.ndim == 1:
+        X = X[:, None]
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    out = npt.zeros(max([Y.shape[1], X.shape[1]]))
+    X = X - X.mean(0)
+    Y = Y - Y.mean(0)
+
+    SX2 = (X ** 2).sum(0) ** 0.5
+    SY2 = (Y ** 2).sum(0) ** 0.5
+    SXY = (X * Y).sum(0)
+    valid = (SX2 != 0) & (SY2 != 0)
+    out[valid] = SXY[valid] / (SX2[valid] * SY2[valid])
+    return out
+
+
+def ridge_cv(X, Y, alphas, independent_alphas=False, Uv=None, scoring="mse"):
     """Similar to sklearn RidgeCV
         - compatible with both numpy and pytorch arrays/tensors
         - optimize a different alpha for each column of Y
@@ -34,6 +55,9 @@ def ridge_cv(X, Y, alphas, independent_alphas=False, Uv=None):
             If True, each target dimension is optimized with a different alpha
         Uv : (array | tensor, array | tensor)
             The result of the SVD, in case it is precomputed.
+        scoring : str | callable
+            the scoring function used to select alpha. Can be 'mse',
+            'correlate' or any function scoring multiple dimensions
 
     Returns
     -------
@@ -48,12 +72,17 @@ def ridge_cv(X, Y, alphas, independent_alphas=False, Uv=None):
     assert len(X) == len(Y)
 
     # Prepare function depending on whether data is numpy or torch
-    module = 'torch' if isinstance(X, torch.Tensor) else 'numpy'
-    device = X.device if module == 'torch' else None
+    module = "torch" if isinstance(X, torch.Tensor) else "numpy"
+    device = X.device if module == "torch" else None
     npt = NumTorch(module, device=device)
 
     if isinstance(alphas, (float, int)):
-        alphas = npt.array([alphas, ], dtype=X.dtype)
+        alphas = npt.array(
+            [
+                alphas,
+            ],
+            dtype=X.dtype,
+        )
     if len(Y.shape) == 1:
         Y = Y[:, None]
     n, n_x = X.shape
@@ -62,7 +91,7 @@ def ridge_cv(X, Y, alphas, independent_alphas=False, Uv=None):
     # Decompose X
     if Uv is None:
         U, s, _ = npt.linealg.svd(X, full_matrices=False)
-        v = s**2
+        v = s ** 2
     else:
         U, v = Uv
     UY = U.transpose(1, 0) @ Y
@@ -86,7 +115,20 @@ def ridge_cv(X, Y, alphas, independent_alphas=False, Uv=None):
     # identify best alpha for each column of Y independently
     if independent_alphas:
 
-        best_alphas = (cv_errors ** 2).mean(1).argmin(0)
+        if scoring == "mse":
+            score = -(cv_errors ** 2).mean(1)
+        else:
+            if scoring == "correlation":
+                scoring = correlate
+
+            score = np.asarray(
+                [
+                    scoring(Y, Y - cv_errors[alpha_idx])
+                    for alpha_idx in range(len(alphas))
+                ]
+            )
+
+        best_alphas = score.argmax(0)
 
         duals = npt.zeros((n, n_y), dtype=X.dtype)
         errors = npt.zeros((n, n_y), dtype=X.dtype)
@@ -131,21 +173,29 @@ class RidgeCV(RegressorMixin, BaseEstimator):
         self.intercept_ : array, shape(n_features, ) | 0.
         self.Uv_ : tuple, in case of pretraining
     """
-    def __init__(self, alphas=(.1, 1., 10.), fit_intercept=True,
-                 normalize=False, independent_alphas=False,
-                 pretrain=False):
+
+    def __init__(
+        self,
+        alphas=(0.1, 1.0, 10.0),
+        fit_intercept=True,
+        normalize=False,
+        independent_alphas=False,
+        pretrain=False,
+        scoring="mse",
+    ):
         self.alphas = alphas
         self.independent_alphas = independent_alphas
         self.fit_intercept = fit_intercept
         self.normalize = normalize
         self.pretrain = pretrain
+        self.scoring = scoring
 
     def _preprocess(self, X, Y):
         assert len(Y.shape) > 1
 
         # Prepare function depending on whether data is numpy or torch
-        module = 'torch' if isinstance(X, torch.Tensor) else 'numpy'
-        device = X.device if module == 'torch' else None
+        module = "torch" if isinstance(X, torch.Tensor) else "numpy"
+        device = X.device if module == "torch" else None
         npt = NumTorch(module, device=device)
 
         # preprocess
@@ -153,7 +203,7 @@ class RidgeCV(RegressorMixin, BaseEstimator):
             X_offset = X.mean(0)
             X = X - X_offset
             if self.normalize:
-                X_scale = (X**2).sum(0) ** .5
+                X_scale = (X ** 2).sum(0) ** 0.5
                 X = X / X_scale[None, :]
             else:
                 X_scale = npt.ones(npt.shape(X)[1])
@@ -167,7 +217,7 @@ class RidgeCV(RegressorMixin, BaseEstimator):
         return X, Y, X_offset, Y_offset, X_scale
 
     def fit(self, X, Y):
-        """ Fit cv-optimized ridge regression.
+        """Fit cv-optimized ridge regression.
 
         Parameters
         ----------
@@ -183,16 +233,20 @@ class RidgeCV(RegressorMixin, BaseEstimator):
         X, Y, X_offset, Y_offset, X_scale = self._preprocess(X, Y)
 
         # Compute X svd, only the first time if pretrained
-        if not self.pretrain or not hasattr(self, 'Uv_'):
-            npt = NumTorch('torch' if isinstance(X, torch.Tensor) else 'numpy')
+        if not self.pretrain or not hasattr(self, "Uv_"):
+            npt = NumTorch("torch" if isinstance(X, torch.Tensor) else "numpy")
             U, s, _ = npt.linealg.svd(X, full_matrices=False)
-            self.Uv_ = (U, s**2)
+            self.Uv_ = (U, s ** 2)
 
         # Fit Ridge CV
         self.coef_, self.alphas_, _ = ridge_cv(
-            X, Y, alphas=self.alphas,
+            X,
+            Y,
+            alphas=self.alphas,
             independent_alphas=self.independent_alphas,
-            Uv=self.Uv_)
+            Uv=self.Uv_,
+            scoring=self.scoring,
+        )
 
         self.coef_ = self.coef_
 
@@ -202,49 +256,49 @@ class RidgeCV(RegressorMixin, BaseEstimator):
             Xoff_coef = X_offset[None, :] @ self.coef_.transpose(1, 0)
             self.intercept_ = Y_offset - Xoff_coef
         else:
-            self.intercept_ = 0.
+            self.intercept_ = 0.0
 
         return self
 
     def predict(self, X):
-        assert hasattr(self, 'coef_')
+        assert hasattr(self, "coef_")
         return X @ self.coef_.transpose(1, 0) + self.intercept_
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Unit tests
 
     from sklearn.linear_model import RidgeCV as SkRidgeCV
     from sklearn.preprocessing import scale
 
-    def make_data(module='numpy'):
+    def make_data(module="numpy"):
         n, dx, dy = 100, 20, 10
         np.random.seed(0)
         X = np.random.randn(n, dx)
         W = np.random.randn(dx, dy)
         Y = X @ W + np.random.randn(n, dy)
         X, Y = scale(X), scale(Y)
-        if module == 'torch':
+        if module == "torch":
             X = torch.from_numpy(X)
             Y = torch.from_numpy(Y)
             W = torch.from_numpy(W)
         return X, Y, W
 
     def test_numpy_identical_to_torch():
-        X, Y, W = make_data('numpy')
+        X, Y, W = make_data("numpy")
         np_ridge = RidgeCV().fit(X, Y).predict(X)
-        X, Y, W = make_data('torch')
+        X, Y, W = make_data("torch")
         th_ridge = RidgeCV().fit(X, Y).predict(X)
         assert_tensor_almost_equal(np_ridge, th_ridge)
 
     def test_pretrain():
-        X, Y, W = make_data('torch')
+        X, Y, W = make_data("torch")
         Yhat = RidgeCV(pretrain=False).fit(X, Y).predict(X)
         Yhat_pretrain = RidgeCV(pretrain=True).fit(X, Y).fit(X, Y).predict(X)
         assert_tensor_almost_equal(Yhat_pretrain, Yhat)
 
     def test_independent_alphas():
-        X, Y, W = make_data('torch')
+        X, Y, W = make_data("torch")
         ridge = RidgeCV(independent_alphas=True).fit(X, Y)
         assert len(ridge.alphas_) == len(Y.T)
 
@@ -252,19 +306,27 @@ if __name__ == '__main__':
         assert len(ridge.alphas_.size()) == 0
 
     def test_identical_to_scikit():
-        X, Y, W = make_data('numpy')
-        alphas = [.1, 1., 10.]
+        X, Y, W = make_data("numpy")
+        alphas = [0.1, 1.0, 10.0]
         for fit_intercept in (False, True):
             for normalize in (False, True):
-                params = dict(alphas=alphas, fit_intercept=fit_intercept,
-                              normalize=normalize)
-                sk = SkRidgeCV(gcv_mode='svd', **params).fit(X, Y)
+                params = dict(
+                    alphas=alphas, fit_intercept=fit_intercept, normalize=normalize
+                )
+                sk = SkRidgeCV(gcv_mode="svd", **params).fit(X, Y)
                 our = RidgeCV(**params).fit(X, Y)
                 assert_tensor_almost_equal(sk.coef_, our.coef_)
                 assert_tensor_almost_equal(sk.predict(X), our.predict(X))
+
+    def test_scoring():
+        X, Y, W = make_data("torch")
+        RidgeCV(scoring="correlate").fit(X, Y)
+        RidgeCV(scoring="mse").fit(X, Y)
+        RidgeCV(scoring=lambda t, p: -np.mean((t - p) ** 2, 0)).fit(X, Y)
 
     # run tests
     test_numpy_identical_to_torch()
     test_pretrain()
     test_independent_alphas()
     test_identical_to_scikit()
+    test_scoring()
